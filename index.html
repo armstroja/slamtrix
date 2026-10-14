@@ -16,7 +16,7 @@ pre{margin:0;white-space:pre-wrap;font:12px monospace}
 <div id="p">
 <div><button id="bT">Self-train</button> <button id="bW" class="on">Watch bot</button> <button id="bH">Teach (you play)</button></div>
 <label>Strategy <select id="ko"><option value="0">Brain only<option value="1">Flat opener<option value="2">PCO opener<option value="3" selected>PC-only: downstack + PC search</select><br>(never stored in the JSON)</label>
-<label><input type="checkbox" id="kp" checked> Planned-move outlines
+<label><input type="checkbox" id="kp" checked> Planned-move outlines (PC plan shows every piece; t=tuck, s=spin, H=hold)
 <select id="kn"><option>1<option>2<option selected>3<option>4</select> pieces</label>
 <div><button id="bE">Export brain</button> <button id="bI">Import brain</button> <button id="bR">Reset</button>
 <input type="file" id="fi" hidden accept=".json"></div>
@@ -47,35 +47,59 @@ function GAME(E){
             if(X<0||X>9||Y<Hh-h||Y>=Hh||((b[Y]>>X)&1)||seen[Y*10+X])continue;seen[Y*10+X]=1;st.push(Y*10+X)}}
         if(n%4)return false}
       return true}
-    function drops(b,id,h){const out=[],sn=new Set();
-      for(let r=0;r<(id==4?1:4);r++)for(let x=-2;x<10;x++){
-        let y=E.SPY;if(E.collide(b,id,r,x,y))continue;while(!E.collide(b,id,r,x,y+1))y++;
-        const k=E.SH[id][r];let bad=false;for(let c=0;c<8;c+=2)if(y+k[c+1]<Hh-h)bad=true;if(bad)continue;
-        const nb=Int32Array.from(b);for(let c=0;c<8;c+=2)nb[y+k[c+1]]|=1<<(x+k[c]);
+    function drops(b,id,h,tk){const out=[],sn=new Set(),lst=[];
+      if(tk){for(const e of E.enumerate(b,id,true,false))lst.push(e.f)}      // tucks + kick/spin placements
+      else for(let r=0;r<(id==4?1:4);r++)for(let x=-2;x<10;x++){let y=E.SPY;if(E.collide(b,id,r,x,y))continue;
+        while(!E.collide(b,id,r,x,y+1))y++;lst.push({x,y,r,v:0})}
+      for(const f of lst){
+        const k=E.SH[id][f.r];let bad=false;for(let c=0;c<8;c+=2)if(f.y+k[c+1]<Hh-h)bad=true;if(bad)continue;
+        let tag='';if(tk){if(E.spinOf(b,id,f.r,f.x,f.y,f.v>0,f.v==2,true))tag='s';
+          else{let y=E.SPY;if(E.collide(b,id,f.r,f.x,y))tag='t';else{while(!E.collide(b,id,f.r,f.x,y+1))y++;if(y!=f.y)tag='t'}}}
+        const nb=Int32Array.from(b);for(let c=0;c<8;c+=2)nb[f.y+k[c+1]]|=1<<(f.x+k[c]);
         let w=Hh-1,cl=0;for(let q=Hh-1;q>=0;q--){if(nb[q]===E.FULL)cl++;else nb[w--]=nb[q]}while(w>=0)nb[w--]=0;
-        const key=nb.subarray(Hh-8).join();if(sn.has(key))continue;sn.add(key);out.push({f:{x,y,r,v:0},nb,h:h-cl})}
-      return out}
+        const key=nb.subarray(Hh-8).join();if(sn.has(key))continue;sn.add(key);out.push({f,nb,h:h-cl,tag})}
+      return out.sort((p,q)=>(p.tag?1:0)-(q.tag?1:0))}
+    // completion check: can the unseen pieces `pcs` finish the clear from this state? (hard drops, hold)
+    function fin(b,pcs,i,hold,hh,left){if(hh==0)return true;if(left<=0||i>=pcs.length)return false;
+      const o=[[pcs[i],i+1,hold]];if(hold){if(hold!=pcs[i])o.push([hold,i+1,pcs[i]])}else if(i+1<pcs.length)o.push([pcs[i+1],i+2,pcs[i]]);
+      for(const[id,ni,nh]of o)for(const d of drops(b,id,hh,false))if(ok(d.nb,d.h)&&fin(d.nb,pcs,ni,nh,d.h,left-1))return true;
+      return false}
+    const rg=E.rng32(7),T=[];for(let t=0;t<30;t++){const a=[1,2,3,4,5,6,7];
+      for(let q=6;q>0;q--){const j=(rg()*(q+1))|0;[a[q],a[j]]=[a[j],a[q]]}T.push(a)}   // sampled orders of the unseen pieces
     const b0=Int32Array.from(g.board);let f=0,top=Hh;
     for(let y=0;y<Hh;y++){let v=b0[y];if(v&&y<top)top=y;while(v){v&=v-1;f++}}
     const sh=Hh-top;if(sh>6)return null;
-    for(let h=Math.max(sh,1);h<=sh+4&&h<=8;h++){
+    for(const tk of[false,true]){nodes=0;for(let h=Math.max(sh,1);h<=sh+4&&h<=8;h++){
       const cells=10*h-f;if(cells<=0||cells%4)continue;const k=cells/4;
       if(k>10||(k>Ln&&f)||!ok(b0,h))continue;
       const memo=new Set();
       const dfs=(b,i,hold,hh,c)=>{
         if(hh==0)return[];if(c>=k)return null;if(i>=Ln)return k>Ln?[]:null;
-        const key=b.subarray(Hh-8).join()+'|'+i+'|'+hold+'|'+hh;if(memo.has(key)||++nodes>cap)return null;
+        const key=b.subarray(Hh-8).join()+'|'+i+'|'+hold+'|'+hh;if(memo.has(key)||++nodes>(tk?cap>>3:cap))return null;
         const opts=[[P[i],i+1,hold,false]];
         if(c>0||g.can){if(hold){if(hold!=P[i])opts.push([hold,i+1,P[i],true])}else if(i+1<Ln)opts.push([P[i+1],i+2,P[i],true])}
-        for(const[id,ni,nh,uh]of opts)for(const d of drops(b,id,hh)){
-          if(!ok(d.nb,d.h))continue;const r=dfs(d.nb,ni,nh,d.h,c+1);if(r){r.unshift({useHold:uh,id,f:d.f});return r}}
+        for(const[id,ni,nh,uh]of opts)for(const d of drops(b,id,hh,tk)){
+          if(!ok(d.nb,d.h))continue;const r=dfs(d.nb,ni,nh,d.h,c+1);if(r){r.unshift({useHold:uh,id,f:d.f,tag:d.tag,off:h-hh,nb:d.nb,nh,hh:d.h});return r}}
         memo.add(key);return null};
-      const r=dfs(b0,0,g.hold,h,0);if(r&&r.length)return r[0]}
+      // Unseen pieces left? Rank candidate first moves by how many sampled futures still finish the PC.
+      const rank=()=>{let best=null,bs=-1,cnt=0;
+        const ro=[[P[0],1,g.hold,false]];
+        if(g.can){if(g.hold){if(g.hold!=P[0])ro.push([g.hold,1,P[0],true])}else if(Ln>1)ro.push([P[1],2,P[0],true])}
+        for(const[id,ni,nh,uh]of ro)for(const d of drops(b0,id,h,tk)){
+          if(cnt>=18)break;if(!ok(d.nb,d.h))continue;cnt++;
+          const rest=dfs(d.nb,ni,nh,d.h,1);if(!rest)continue;
+          const ch=[{useHold:uh,id,f:d.f,tag:d.tag,off:0,nb:d.nb,nh,hh:d.h},...rest],e=ch[ch.length-1],left=k-ch.length;
+          let sc=e.hh==0?99:0;if(left>0&&e.hh>0)for(const t of T)if(fin(e.nb,t.slice(0,left+1),0,e.nh,e.hh,left))sc++;
+          if(sc>bs){bs=sc;best=ch}}
+        return best};
+      const r=(k>Ln&&!f)?rank():dfs(b0,0,g.hold,h,0);if(r&&r.length)return r}}
     return null}
+  function chain(g,cap){const key=g.n+'|'+g.hold+'|'+g.cur+'|'+g.queue.join();   // cached per game state
+    if(g.pcc&&g.pcc.key==key)return g.pcc.c;const c=pcPlan(g,cap);g.pcc={key,c};return c}
   function plan(g,w,o,op){
-    if(op==3){const p=pcPlan(g,g.pv?3000:6000);if(p)return p;   // PC-only: search, else downstack
+    if(op==3){const c=g.pv?null:chain(g,6000);if(c)return c[0];   // PC-only: search, else downstack
       w=w.map((v,i)=>i<7?v*1.5:i==7?1:0);return E.planPath(st(g),w,Object.assign({},o,{noise:0,mistake:0,look:6}))}
-    if(op==2&&g.n<10){const p=pcPlan(g,40000);if(p)return p}if(op&&g.n<7){w=OW;o=Object.assign({},o,{useHold:false,noise:0,mistake:0,look:8})}
+    if(op==2&&g.n<10){const c=chain(g,40000);if(c)return c[0]}if(op&&g.n<7){w=OW;o=Object.assign({},o,{useHold:false,noise:0,mistake:0,look:8})}
     return E.planPath(st(g),w,o)}
   function apply(g,p){
     const id=p.id;
@@ -89,7 +113,9 @@ function GAME(E){
     g.cur=g.queue.shift();g.queue.push(g.bag());
     if(E.collide(g.board,g.cur,0,E.SPX[g.cur],E.SPY))g.dead=true}
   function clone(g){return Object.assign({},g,{board:Int32Array.from(g.board),queue:g.queue.slice(),bag:()=>0,pv:true})}
-  function preview(g,w,o,op,k){const c=clone(g),out=[];
+  function preview(g,w,o,op,k){
+    if(op==3||(op==2&&g.n<10)){const ch=chain(g,op==3?6000:40000);if(ch)return ch}   // whole planned PC
+    const c=clone(g),out=[];
     for(let i=0;i<k&&!c.dead;i++){if(!c.cur||!c.queue[0]||!c.queue[1])break;
       const p=plan(c,w,o,op);if(!p)break;out.push(p);apply(c,p)}return out}
   const score=g=>g.atk+g.lines*.05+g.n*.05-(g.dead?3:0);
@@ -166,9 +192,9 @@ function draw(){
     for(const[x,y]of cells(pid(),u.f))if(y>=0)cv.fillRect(x*30+1,y*30+1,28,28);cv.globalAlpha=1}}
   if($('kp').checked&&!g.dead){
     G.preview(g,B.mean,OPT,+$('ko').value,+$('kn').value).forEach((p,i)=>{
-      cv.strokeStyle=COL[p.id];cv.fillStyle=COL[p.id];cv.lineWidth=2;cv.globalAlpha=1-i*.2;cv.setLineDash(i?[5,4]:[]);
-      let first=true;for(const[x,y]of cells(p.id,p.f)){if(y<0)continue;cv.strokeRect(x*30+2,y*30+2,26,26);
-        if(first){cv.setLineDash([]);cv.font='bold 14px sans-serif';cv.fillText((p.useHold?'H':'')+(i+1),x*30+6,y*30+20);cv.setLineDash(i?[5,4]:[]);first=false}}});
+      cv.strokeStyle=COL[p.id];cv.fillStyle=COL[p.id];cv.lineWidth=2;cv.globalAlpha=Math.max(.45,1-i*.08);cv.setLineDash(i?[5,4]:[]);
+      let first=true;for(const[x,y]of cells(p.id,Object.assign({},p.f,{y:p.f.y-(p.off||0)}))){if(y<0)continue;cv.strokeRect(x*30+2,y*30+2,26,26);
+        if(first){cv.setLineDash([]);cv.font='bold 14px sans-serif';cv.fillText((p.useHold?'H':'')+(i+1)+(p.tag||''),x*30+6,y*30+20);cv.setLineDash(i?[5,4]:[]);first=false}}});
     cv.globalAlpha=1;cv.setLineDash([])}
   if(g.dead){cv.fillStyle='rgba(0,0,0,.6)';cv.fillRect(0,250,300,60);cv.fillStyle='#fff';cv.font='20px sans-serif';cv.fillText('GAME OVER',90,288)}}
 function ui(){$('s').textContent=`Brain ${B.name}   gen ${B.gen}
