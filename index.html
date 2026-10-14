@@ -1,0 +1,194 @@
+<!doctype html>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Stack Trainer</title>
+<style>
+:root{color-scheme:dark light;--bg:#111;--fg:#ddd;--bd:#555;--bt:#222}
+@media(prefers-color-scheme:light){:root{--bg:#f4f4f4;--fg:#222;--bd:#999;--bt:#fff}}
+body{margin:0;background:var(--bg);color:var(--fg);font:13px system-ui,sans-serif;display:flex;gap:16px;padding:12px;flex-wrap:wrap}
+canvas{background:#000;border:1px solid var(--bd);max-width:100%}
+button{background:var(--bt);color:var(--fg);border:1px solid var(--bd);padding:6px 10px;border-radius:4px;cursor:pointer}
+button.on{background:#2a6;color:#fff;border-color:#2a6}
+select{background:var(--bt);color:var(--fg)}
+#p{max-width:360px;display:flex;flex-direction:column;gap:9px}
+pre{margin:0;white-space:pre-wrap;font:12px monospace}
+</style>
+<canvas id="c" width="300" height="600"></canvas>
+<div id="p">
+<div><button id="bT">Self-train</button> <button id="bW" class="on">Watch bot</button> <button id="bH">Teach (you play)</button></div>
+<label>Strategy <select id="ko"><option value="0">Brain only<option value="1">Flat opener<option value="2">PCO opener<option value="3" selected>PC-only: downstack + PC search</select><br>(never stored in the JSON)</label>
+<label><input type="checkbox" id="kp" checked> Planned-move outlines
+<select id="kn"><option>1<option>2<option selected>3<option>4</select> pieces</label>
+<div><button id="bE">Export brain</button> <button id="bI">Import brain</button> <button id="bR">Reset</button>
+<input type="file" id="fi" hidden accept=".json"></div>
+<pre id="s"></pre>
+<div>Teach mode: ← → choose column, ↑ rotate, C hold, Space lock. When your pick differs from the bot's pick, its weights move toward yours. Enter restarts after game over.</div>
+</div>
+<script src="engine.js"></script>
+<script>
+/* ---- Game wrapper (also runs inside workers). Opener lives here, not in the brain. ---- */
+function GAME(E){
+  const OW=[-14,-1.2,-.15,-.6,-.4,-.6,-2,.3,.3,0,0,0,0]; // fixed opener weights: flat, hole-free
+  function newGame(seed,pv){const bag=E.Bag(seed),rng=E.rng32(seed+99);
+    const g={bag,rng,board:new Int32Array(E.H),cur:bag(),hold:0,queue:[],b2b:-1,combo:-1,can:true,n:0,lines:0,atk:0,dead:false,pv};
+    for(let i=0;i<6;i++)g.queue.push(bag());return g}
+  function st(g){return{board:Array.from(g.board),cur:g.cur,hold:g.hold,queue:g.queue,b2b:g.b2b,combo:g.combo,canHold:g.can}}
+  /* PC search on ANY board: box = bottom h rows (h >= stack height), k = (10h - filled)/4 pieces needed.
+     Hard drops, no holes, every empty region a multiple of 4, hold allowed. From an empty board
+     (new PC chain) it is heuristic over the visible queue; otherwise it is exact. */
+  function pcPlan(g,cap){
+    const P=[g.cur,...g.queue],Hh=E.H;let Ln=P.indexOf(0);if(Ln<0)Ln=P.length;let nodes=0;
+    function ok(b,h){
+      for(let x=0;x<10;x++){let s=0;for(let y=Hh-h;y<Hh;y++){if((b[y]>>x)&1)s=1;else if(s)return false}}
+      const seen=new Uint8Array(Hh*10);
+      for(let y0=Hh-h;y0<Hh;y0++)for(let x0=0;x0<10;x0++){if(((b[y0]>>x0)&1)||seen[y0*10+x0])continue;
+        let n=0;const st=[y0*10+x0];seen[st[0]]=1;
+        while(st.length){const q=st.pop();n++;const y=(q/10)|0,x=q%10;
+          for(const[dx,dy]of[[1,0],[-1,0],[0,1],[0,-1]]){const X=x+dx,Y=y+dy;
+            if(X<0||X>9||Y<Hh-h||Y>=Hh||((b[Y]>>X)&1)||seen[Y*10+X])continue;seen[Y*10+X]=1;st.push(Y*10+X)}}
+        if(n%4)return false}
+      return true}
+    function drops(b,id,h){const out=[],sn=new Set();
+      for(let r=0;r<(id==4?1:4);r++)for(let x=-2;x<10;x++){
+        let y=E.SPY;if(E.collide(b,id,r,x,y))continue;while(!E.collide(b,id,r,x,y+1))y++;
+        const k=E.SH[id][r];let bad=false;for(let c=0;c<8;c+=2)if(y+k[c+1]<Hh-h)bad=true;if(bad)continue;
+        const nb=Int32Array.from(b);for(let c=0;c<8;c+=2)nb[y+k[c+1]]|=1<<(x+k[c]);
+        let w=Hh-1,cl=0;for(let q=Hh-1;q>=0;q--){if(nb[q]===E.FULL)cl++;else nb[w--]=nb[q]}while(w>=0)nb[w--]=0;
+        const key=nb.subarray(Hh-8).join();if(sn.has(key))continue;sn.add(key);out.push({f:{x,y,r,v:0},nb,h:h-cl})}
+      return out}
+    const b0=Int32Array.from(g.board);let f=0,top=Hh;
+    for(let y=0;y<Hh;y++){let v=b0[y];if(v&&y<top)top=y;while(v){v&=v-1;f++}}
+    const sh=Hh-top;if(sh>6)return null;
+    for(let h=Math.max(sh,1);h<=sh+4&&h<=8;h++){
+      const cells=10*h-f;if(cells<=0||cells%4)continue;const k=cells/4;
+      if(k>10||(k>Ln&&f)||!ok(b0,h))continue;
+      const memo=new Set();
+      const dfs=(b,i,hold,hh,c)=>{
+        if(hh==0)return[];if(c>=k)return null;if(i>=Ln)return k>Ln?[]:null;
+        const key=b.subarray(Hh-8).join()+'|'+i+'|'+hold+'|'+hh;if(memo.has(key)||++nodes>cap)return null;
+        const opts=[[P[i],i+1,hold,false]];
+        if(c>0||g.can){if(hold){if(hold!=P[i])opts.push([hold,i+1,P[i],true])}else if(i+1<Ln)opts.push([P[i+1],i+2,P[i],true])}
+        for(const[id,ni,nh,uh]of opts)for(const d of drops(b,id,hh)){
+          if(!ok(d.nb,d.h))continue;const r=dfs(d.nb,ni,nh,d.h,c+1);if(r){r.unshift({useHold:uh,id,f:d.f});return r}}
+        memo.add(key);return null};
+      const r=dfs(b0,0,g.hold,h,0);if(r&&r.length)return r[0]}
+    return null}
+  function plan(g,w,o,op){
+    if(op==3){const p=pcPlan(g,g.pv?3000:6000);if(p)return p;   // PC-only: search, else downstack
+      w=w.map((v,i)=>i<7?v*1.5:i==7?1:0);return E.planPath(st(g),w,Object.assign({},o,{noise:0,mistake:0,look:6}))}
+    if(op==2&&g.n<10){const p=pcPlan(g,40000);if(p)return p}if(op&&g.n<7){w=OW;o=Object.assign({},o,{useHold:false,noise:0,mistake:0,look:8})}
+    return E.planPath(st(g),w,o)}
+  function apply(g,p){
+    const id=p.id;
+    if(p.useHold){if(g.hold)g.hold=g.cur;else{g.hold=g.cur;g.queue.shift();g.queue.push(g.bag())}g.can=false}else g.can=true;
+    const r=E.sim(g.board,id,p.f,g.b2b,g.combo,true);
+    if(r.dead){g.dead=true;return}
+    g.board=r.board;g.b2b=r.b2b;g.combo=r.combo;g.lines+=r.lines;g.atk+=r.atk;g.n++;g.pcs=(g.pcs||0)+(r.pc?1:0);
+    if(!r.lines&&!g.pv&&g.n>10&&g.n%6==0){            // light garbage pressure
+      if(g.board[0])g.dead=true;else{const h=(g.rng()*10)|0;
+        for(let i=0;i<E.H-1;i++)g.board[i]=g.board[i+1];g.board[E.H-1]=E.FULL&~(1<<h)}}
+    g.cur=g.queue.shift();g.queue.push(g.bag());
+    if(E.collide(g.board,g.cur,0,E.SPX[g.cur],E.SPY))g.dead=true}
+  function clone(g){return Object.assign({},g,{board:Int32Array.from(g.board),queue:g.queue.slice(),bag:()=>0,pv:true})}
+  function preview(g,w,o,op,k){const c=clone(g),out=[];
+    for(let i=0;i<k&&!c.dead;i++){if(!c.cur||!c.queue[0]||!c.queue[1])break;
+      const p=plan(c,w,o,op);if(!p)break;out.push(p);apply(c,p)}return out}
+  const score=g=>g.atk+g.lines*.05+g.n*.05-(g.dead?3:0);
+  return{newGame,plan,apply,preview,score}}
+function WK(){const E=ENGINE(),G=GAME(E);
+  onmessage=e=>{const{ws,seeds,n,op}=e.data;
+    postMessage(ws.map(w=>{let s=0,a=0;
+      for(const sd of seeds){const g=G.newGame(sd);
+        while(!g.dead&&g.n<n){const p=G.plan(g,w,{tucks:true,useHold:true,look:4,noise:0,mistake:0,allMini:true,appOnly:false},op);
+          if(!p){g.dead=true;break}G.apply(g,p)}
+        s+=G.score(g);a+=g.atk/Math.max(1,g.n)}
+      return[s/seeds.length,a/seeds.length]}))}}
+
+/* ---- App ---- */
+const E=ENGINE(),G=GAME(E),$=i=>document.getElementById(i),L=' IJLOSTZ';
+const SC=[1,3,10,3,5,3,3,1,3,2,1,1,1];
+const fresh=()=>({name:'TRAINEE',mean:Array.from(E.DEF),gen:0,appEma:null,sigma:E.DEF.map(v=>Math.max(.3*Math.abs(v),.2)),taught:0,best:0});
+function load(){try{const b=JSON.parse(localStorage.getItem('brain'));return b&&b.mean.length==E.KEYS.length?b:null}catch(e){return null}}
+function save(){try{localStorage.setItem('brain',JSON.stringify(B))}catch(e){}}
+let B=load()||fresh();
+const OPT={tucks:true,useHold:true,look:6,noise:0,mistake:0,allMini:true,appOnly:false};
+const COL=['','#0cf','#46f','#f90','#fd0','#4c4','#c4f','#f44'];
+const cv=$('c').getContext('2d');
+let g,mode='watch',sel,cands=null,training=false,pool=[];
+const NW=Math.max(1,Math.min(8,(navigator.hardwareConcurrency||4)-1));
+function newG(){g=G.newGame(Math.random()*1e9|0);cands=null;sel={r:0,x:E.SPX[g.cur],h:false}}
+newG();
+
+/* self-training: cross-entropy method over the 13 weights, games run in workers */
+function mk(){const u=URL.createObjectURL(new Blob([ENGINE.toString(),'\n',GAME.toString(),'\n(',WK.toString(),')()'],{type:'text/javascript'}));
+  pool=Array.from({length:NW},()=>new Worker(u))}
+const run=(wk,ws,seeds)=>new Promise(r=>{wk.onmessage=e=>r(e.data);wk.postMessage({ws,seeds,n:100,op:+$('ko').value})});
+const gz=()=>{let u=0,v=0;while(!u)u=Math.random();while(!v)v=Math.random();return Math.sqrt(-2*Math.log(u))*Math.cos(6.2832*v)};
+async function genStep(){
+  const P=NW*4,m0=B.mean.slice(),seeds=[Math.random()*1e9|0,Math.random()*1e9|0];
+  const pop=Array.from({length:P},(_,i)=>i?m0.map((m,j)=>m+B.sigma[j]*gz()):m0.slice());
+  const res=await Promise.all(pool.map((wk,k)=>run(wk,pop.filter((_,i)=>i%NW==k),seeds)));
+  const sc=pop.map((w,i)=>{const r=res[i%NW][(i-i%NW)/NW];return{w,s:r[0],a:r[1]}}).sort((a,b)=>b.s-a.s);
+  const el=sc.slice(0,Math.max(3,P>>2)),d=B.mean.map((v,j)=>v-m0[j]);   // d = what you taught meanwhile
+  const nm=m0.map((_,j)=>el.reduce((t,e)=>t+e.w[j],0)/el.length);
+  B.sigma=nm.map((m,j)=>Math.max(.6*Math.sqrt(el.reduce((t,e)=>t+(e.w[j]-m)**2,0)/el.length)+.36*B.sigma[j],.02+.02*Math.abs(m)));
+  B.mean=nm.map((v,j)=>v+d[j]);B.gen++;B.best=sc[0].s;
+  const a=el.reduce((t,e)=>t+e.a,0)/el.length;B.appEma=B.appEma==null?a:.8*B.appEma+.2*a;save()}
+async function trainLoop(){while(training){await genStep();ui()}}
+
+/* teaching: pick a placement; perceptron-style nudge toward your choice */
+function pid(){return sel.h&&g.can?(g.hold||g.queue[0]):g.cur}
+function tCands(){return cands||(cands=E.enumerate(Int32Array.from(g.board),pid(),true,false))}
+function pick(){const c=tCands().filter(e=>e.f.r==sel.r);if(!c.length)return null;let b=c[0];
+  for(const e of c)if(Math.abs(e.f.x-sel.x)<Math.abs(b.f.x-sel.x)||(e.f.x==b.f.x&&e.f.y>b.f.y))b=e;return b}
+function lock(){const u=pick();if(!u)return;const bd=g.board,id=pid(),uh=sel.h&&g.can;let best=null,bs=-1e18;
+  for(const c of tCands()){const s=E.reward(E.sim(bd,id,c.f,g.b2b,g.combo,true),B.mean,false);if(s>bs){bs=s;best=c}}
+  if(best&&(best.f.x!=u.f.x||best.f.y!=u.f.y||best.f.r!=u.f.r)){
+    const ru=E.sim(bd,id,u.f,g.b2b,g.combo,true),rb=E.sim(bd,id,best.f,g.b2b,g.combo,true);
+    if(!ru.dead&&!rb.dead){const fu=Array.from(E.feats(ru)),fb=Array.from(E.feats(rb));
+      for(let i=0;i<fu.length;i++)B.mean[i]+=.2*(fu[i]-fb[i])/SC[i];B.taught++;save()}}
+  G.apply(g,{useHold:!!uh,id,f:u.f});cands=null;sel={r:0,x:E.SPX[g.cur],h:false};draw();ui()}
+onkeydown=e=>{if(mode!='teach')return;const k=e.key;
+  if(g.dead){if(k=='Enter'){newG();draw();ui()}return}
+  if(k=='ArrowLeft'||k=='ArrowRight'){
+    const xs=[...new Set(tCands().filter(c=>c.f.r==sel.r).map(c=>c.f.x))].sort((a,b)=>a-b),cu=pick();
+    let i=xs.indexOf(cu?cu.f.x:sel.x);i=Math.max(0,Math.min(xs.length-1,i+(k=='ArrowLeft'?-1:1)));sel.x=xs[i]}
+  else if(k=='ArrowUp'){for(let i=1;i<=4;i++){const r=(sel.r+i)&3;if(tCands().some(c=>c.f.r==r)){sel.r=r;break}}}
+  else if(k=='c'||k=='C'){if(g.can){sel.h=!sel.h;cands=null;sel.r=0;sel.x=E.SPX[pid()]}}
+  else if(k==' '||k=='Enter')lock();else return;
+  e.preventDefault();draw()};
+
+/* drawing: board, planned-move outlines (numbered, dashed after the first), teach ghost */
+const cells=(id,f)=>{const k=E.SH[id][f.r],o=[];for(let c=0;c<8;c+=2)o.push([f.x+k[c],f.y+k[c+1]-E.TOP]);return o};
+function draw(){
+  cv.clearRect(0,0,300,600);cv.globalAlpha=1;cv.setLineDash([]);cv.fillStyle='#778899';
+  for(let y=E.TOP;y<E.H;y++)for(let x=0;x<10;x++)if((g.board[y]>>x)&1)cv.fillRect(x*30+1,(y-E.TOP)*30+1,28,28);
+  if(mode=='teach'&&!g.dead){const u=pick();if(u){cv.globalAlpha=.5;cv.fillStyle=COL[pid()];
+    for(const[x,y]of cells(pid(),u.f))if(y>=0)cv.fillRect(x*30+1,y*30+1,28,28);cv.globalAlpha=1}}
+  if($('kp').checked&&!g.dead){
+    G.preview(g,B.mean,OPT,+$('ko').value,+$('kn').value).forEach((p,i)=>{
+      cv.strokeStyle=COL[p.id];cv.fillStyle=COL[p.id];cv.lineWidth=2;cv.globalAlpha=1-i*.2;cv.setLineDash(i?[5,4]:[]);
+      let first=true;for(const[x,y]of cells(p.id,p.f)){if(y<0)continue;cv.strokeRect(x*30+2,y*30+2,26,26);
+        if(first){cv.setLineDash([]);cv.font='bold 14px sans-serif';cv.fillText((p.useHold?'H':'')+(i+1),x*30+6,y*30+20);cv.setLineDash(i?[5,4]:[]);first=false}}});
+    cv.globalAlpha=1;cv.setLineDash([])}
+  if(g.dead){cv.fillStyle='rgba(0,0,0,.6)';cv.fillRect(0,250,300,60);cv.fillStyle='#fff';cv.font='20px sans-serif';cv.fillText('GAME OVER',90,288)}}
+function ui(){$('s').textContent=`Brain ${B.name}   gen ${B.gen}
+best fitness ${B.best.toFixed(2)}   appEma ${B.appEma==null?'-':B.appEma.toFixed(2)}
+taught ${B.taught}   workers ${NW}   training ${training?'ON':'off'}
+Game: pieces ${g.n}  lines ${g.lines}  attack ${g.atk}  PCs ${g.pcs||0}
+Next ${g.queue.slice(0,5).map(i=>L[i]).join(' ')}   Hold ${L[g.hold]||'-'}   Mode ${mode}`}
+setInterval(()=>{if(mode=='watch'){if(g.dead){newG()}else{const p=G.plan(g,B.mean,OPT,+$('ko').value);if(p)G.apply(g,p);else g.dead=true}}draw();ui()},150);
+
+/* buttons */
+function setMode(m){mode=m;$('bW').classList.toggle('on',m=='watch');$('bH').classList.toggle('on',m=='teach');newG();draw()}
+$('bW').onclick=()=>setMode('watch');$('bH').onclick=()=>setMode('teach');
+$('bT').onclick=()=>{if(training){training=false}else{if(!pool.length)mk();training=true;trainLoop()}$('bT').classList.toggle('on',training)};
+$('bE').onclick=()=>{const a=document.createElement('a');
+  a.href=URL.createObjectURL(new Blob([JSON.stringify({format:'stack-rival-brain',bot:{name:B.name,mean:B.mean,gen:B.gen,appEma:B.appEma,sigma:B.sigma}},null,1)],{type:'application/json'}));
+  a.download='brain.json';a.click()};
+$('bI').onclick=()=>$('fi').click();
+$('fi').onchange=async e=>{try{let j=JSON.parse(await e.target.files[0].text());j=j.bot||j;
+  if(!Array.isArray(j.mean)||j.mean.length!=E.KEYS.length||!j.mean.every(Number.isFinite))throw 0;
+  B=Object.assign(fresh(),{name:String(j.name||'IMPORT').toUpperCase().replace(/[^A-Z0-9_-]/g,'').slice(0,10),mean:j.mean,gen:j.gen||0,appEma:j.appEma??null,sigma:j.sigma&&j.sigma.length==j.mean.length?j.sigma:j.mean.map(v=>Math.max(.15*Math.abs(v),.1))});
+  save();ui()}catch(x){alert('Not a valid brain for this engine ('+E.KEYS.length+' weights)')}e.target.value=''};
+$('bR').onclick=()=>{if(confirm('Reset brain to defaults?')){B=fresh();save();ui()}};
+</script>
