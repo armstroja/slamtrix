@@ -94,8 +94,26 @@ function GAME(E){
         return best};
       const r=(k>Ln&&!f)?rank():dfs(b0,0,g.hold,h,0);if(r&&r.length)return r}}
     return null}
+  /* PCO template (パフェクリテンプレ): grey setup M = 24 cells built from the six non-I pieces of the first bag,
+     I stays in hold; the coloured pocket (cols 3-7) is then solved by the PC search. Rows top->bottom of the 4-row box. */
+  const MR=[[0,1,2,8,9],[0,1,2,7,8,9],[0,1,2,6,7,8,9],[0,1,2,7,8,9]].map(a=>a.reduce((m,x)=>m|1<<x,0));
+  function pcoPlan(g){
+    if(g.n>=6||g.lines)return null;
+    const Hh=E.H,Lq=[g.cur,...g.queue],R=7-g.n-(g.hold?1:0);
+    if(R<1||(g.hold&&g.hold!=1)||Lq.slice(0,R).includes(0))return null;
+    for(let y=0;y<Hh;y++){const m=g.board[y];if(y<Hh-4?m:(m&~MR[y-Hh+4]))return null}
+    let hold=g.hold,pend=false;const plays=[];
+    for(const id of Lq.slice(0,R)){if(id==1){if(hold)return null;hold=1;pend=true}else{plays.push({id,useHold:pend});pend=false}}
+    if(plays.length!=6-g.n)return null;
+    const mv=[],go=(j,b)=>{if(j==plays.length)return true;const{id,useHold}=plays[j];
+      for(const e of E.enumerate(b,id,true,false)){const k=E.SH[id][e.f.r];let c2=true;
+        for(let c=0;c<8;c+=2){const X=e.f.x+k[c],Y=e.f.y+k[c+1];if(Y<Hh-4||!((MR[Y-Hh+4]>>X)&1)){c2=false;break}}
+        if(!c2)continue;const nb=Int32Array.from(b);for(let c=0;c<8;c+=2)nb[e.f.y+k[c+1]]|=1<<(e.f.x+k[c]);
+        mv.push({useHold,id,f:e.f,tag:'',off:0});if(go(j+1,nb))return true;mv.pop()}
+      return false};
+    return go(0,Int32Array.from(g.board))?mv.slice():null}
   function chain(g,cap){const key=g.n+'|'+g.hold+'|'+g.cur+'|'+g.queue.join();   // cached per game state
-    if(g.pcc&&g.pcc.key==key)return g.pcc.c;const c=pcPlan(g,cap);g.pcc={key,c};return c}
+    if(g.pcc&&g.pcc.key==key)return g.pcc.c;const c=(g.n<7?pcoPlan(g):null)||pcPlan(g,cap);g.pcc={key,c};return c}
   function plan(g,w,o,op){
     if(op==3){const c=g.pv?null:chain(g,6000);if(c)return c[0];   // PC-only: search, else downstack
       w=w.map((v,i)=>i<7?v*1.5:i==7?1:0);return E.planPath(st(g),w,Object.assign({},o,{noise:0,mistake:0,look:6}))}
